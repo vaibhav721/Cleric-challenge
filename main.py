@@ -383,64 +383,6 @@ def simplify_name(name):
     simplified_name = re.sub(r'-[a-z0-9]{9,}$', '', name)
     return simplified_name
 
-@app.route('/deploy', methods=['POST'])
-def deploy_application():
-    try:
-        # Get deployment name from the request body
-        deployment_name = request.json.get('deployment_name')
-        if not deployment_name:
-            return jsonify({"error": "Deployment name is required"}), 400
-
-        # Define the YAML deployment configuration
-        deployment_yaml = {
-            'apiVersion': 'apps/v1',
-            'kind': 'Deployment',
-            'metadata': {'name': deployment_name, 'labels': {'app': 'sample-app'}},
-            'spec': {
-                'replicas': 2,
-                'selector': {'matchLabels': {'app': 'sample-app'}},
-                'template': {
-                    'metadata': {'labels': {'app': 'sample-app'}},
-                    'spec': {
-                        'containers': [{
-                            'name': 'nginx',
-                            'image': 'nginx:latest',
-                            'ports': [{'containerPort': 80}]
-                        }]
-                    }
-                }
-            }
-        }
-
-        # Save YAML configuration to a temporary file
-        yaml_file = f"{deployment_name}.yaml"
-        with open(yaml_file, 'w') as file:
-            yaml.dump(deployment_yaml, file)
-
-        # Apply the deployment using kubectl
-        subprocess.run(["kubectl", "apply", "-f", yaml_file], check=True)
-
-        # Clean up the temporary file
-        os.remove(yaml_file)
-
-        # Return a successful deployment message
-        full_name = f"deployments.apps/{deployment_name}"
-        return jsonify({"status": f"Deployment {full_name} started successfully!"})
-
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"Failed to deploy application: {str(e)}"}), 500
-    except Exception as e:
-        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
-
-@app.route('/stop', methods=['POST'])
-def stop_deployment():
-    try:
-        deployment_name = request.json.get('deployment')
-        subprocess.run(f"kubectl delete deployment {deployment_name}", shell=True, check=True)
-        return jsonify({"status": f"Deployment {deployment_name} stopped successfully!"})
-    except subprocess.CalledProcessError:
-        return jsonify({"error": "Failed to stop deployment."}), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
