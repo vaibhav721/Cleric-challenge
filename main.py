@@ -1,0 +1,446 @@
+import os
+import json
+import re
+from flask import Flask, request, jsonify
+from pydantic import BaseModel, ValidationError
+from loguru import logger
+from kubernetes import client, config
+import openai
+import subprocess
+import yaml
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app,origins='http://localhost:3000')
+
+logger.add("agent.log", rotation="1 MB")
+
+class QueryRequest(BaseModel):
+    query: str
+
+class QueryResponse(BaseModel):
+    query: str
+    answer: str
+
+try:
+    config.load_kube_config()
+    logger.info("Kubernetes configuration loaded successfully.")
+except Exception as e:
+    logger.error(f"Failed to load Kubernetes configuration: {e}")
+    raise
+
+core_v1_api = client.CoreV1Api()
+apps_v1_api = client.AppsV1Api()
+
+
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    logger.error("OpenAI API key is not set. Please set the OPENAI_API_KEY environment variable.")
+    raise Exception("OpenAI API key is not set.")
+
+
+@app.route("/query", methods=["POST"])
+def query_kubernetes():
+    data = request.get_json()
+
+    try:
+        query_request = QueryRequest(**data)
+    except ValidationError as e:
+        logger.error(f"Request validation error: {e}")
+        return jsonify({"error": "Invalid request format"}), 400
+
+    logger.info(f"Received query: {query_request.query}")
+
+    try:
+        action = interpret_query(query_request.query)
+        logger.info(f"Interpreted action: {action}")
+
+        answer = perform_kubernetes_action(action)
+        logger.info(f"Answer: {answer}")
+
+        # Validate response format with Pydantic
+        query_response = QueryResponse(query=query_request.query, answer=answer)
+        return jsonify(query_response.dict())
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        return jsonify({"error": "An error occurred while processing your request."}), 500
+
+# Function to interpret the query using GPT-4
+def interpret_query(query_text):
+    system_prompt = (
+        "You are a Kubernetes assistant. Your task is to interpret the user's query and output a JSON object "
+        "with two keys: 'action' and 'parameters'. The 'action' must be one of ['count_resources', 'get_status', 'list_resources', 'get_logs', 'describe_resource']. "
+        "If the user's intent does not match any of these actions, set 'action' to 'unknown'. "
+        "The 'parameters' should include 'resource_type' (one of ['pod', 'deployment', 'service', 'node'] in singular form), "
+        "'resource_name' if applicable, and 'namespace' if specified. Do not include any additional text outside of the JSON object."
+    )
+    print("query to OPENAI",query_text)
+    user_prompt = f"User query: {query_text}\nResponse:"
+
+    response = openai.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0,
+        max_tokens=150
+    )
+
+    assistant_reply = response.choices[0].message.content.strip()
+    logger.debug(f"Assistant reply: {assistant_reply}")
+
+    try:
+        action = json.loads(assistant_reply)
+        if 'action' not in action or 'parameters' not in action:
+            raise ValueError("Invalid format: Missing 'action' or 'parameters' keys.")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse assistant's reply as JSON: {e}")
+        raise Exception("Failed to interpret the query.")
+
+    return action
+
+# Function to normalize action types
+def normalize_action_type(action_type):
+    action_mapping = {
+        'count_pods': 'count_resources',
+        'count_deployments': 'count_resources',
+        'count_nodes': 'count_resources',
+        'count_services': 'count_resources',
+        'get_pod_status': 'get_status',
+        'get_deployment_status': 'get_status',
+        'get_service_status': 'get_status',
+        'list_pods': 'list_resources',
+        'list_deployments': 'list_resources',
+        'list_services': 'list_resources',
+        'get_pod_logs': 'get_logs',
+        'describe_pod': 'describe_resource',
+        'describe_deployment': 'describe_resource',
+        'get_pod_details': 'describe_resource',
+    }
+    return action_mapping.get(action_type, action_type)
+
+# Enhanced function to normalize resource types
+def normalize_resource_type(resource_type):
+    resource_type_mapping = {
+        'pods': 'pod',
+        'pod': 'pod',
+        'po': 'pod',
+        'p': 'pod',
+        'deployments': 'deployment',
+        'deployment': 'deployment',
+        'deploy': 'deployment',
+        'dep': 'deployment',
+        'services': 'service',
+        'service': 'service',
+        'svc': 'service',
+        'nodes': 'node',
+        'node': 'node',
+        'no': 'node',
+        'configmaps': 'configmap',
+        'configmap': 'configmap',
+        'cm': 'configmap',
+        'secrets': 'secret',
+        'secret': 'secret',
+        'sec': 'secret',
+        'namespaces': 'namespace',
+        'namespace': 'namespace',
+        'ns': 'namespace',
+        'endpoints': 'endpoint',
+        'endpoint': 'endpoint',
+        'ep': 'endpoint',
+        'ingresses': 'ingress',
+        'ingress': 'ingress',
+        'ing': 'ingress',
+        'persistentvolumeclaims': 'persistentvolumeclaim',
+        'persistentvolumeclaim': 'persistentvolumeclaim',
+        'pvc': 'persistentvolumeclaim',
+        'persistentvolumes': 'persistentvolume',
+        'persistentvolume': 'persistentvolume',
+        'pv': 'persistentvolume',
+        'replicasets': 'replicaset',
+        'replicaset': 'replicaset',
+        'rs': 'replicaset',
+        'statefulsets': 'statefulset',
+        'statefulset': 'statefulset',
+        'sts': 'statefulset',
+        'daemonsets': 'daemonset',
+        'daemonset': 'daemonset',
+        'ds': 'daemonset',
+        'jobs': 'job',
+        'job': 'job',
+        'cronjobs': 'cronjob',
+        'cronjob': 'cronjob',
+        'cj': 'cronjob',
+        'roles': 'role',
+        'role': 'role',
+        'rolebindings': 'rolebinding',
+        'rolebinding': 'rolebinding',
+        'rb': 'rolebinding',
+        'clusterroles': 'clusterrole',
+        'clusterrole': 'clusterrole',
+        'cr': 'clusterrole',
+        'clusterrolebindings': 'clusterrolebinding',
+        'clusterrolebinding': 'clusterrolebinding',
+        'crb': 'clusterrolebinding',
+    }
+    return resource_type_mapping.get(resource_type.lower(), resource_type.lower())
+
+# Function to perform the Kubernetes action
+def perform_kubernetes_action(action):
+    try:
+        print(action)
+        if action.get("action") == "unknown" or not action.get("parameters"):
+            user_query = action.get("query", "Unknown query")
+            logger.info("Action or parameters not recognized, delegating to handle_unknown_action.")
+            return handle_unknown_action({"query": user_query})
+        
+
+        action_type = normalize_action_type(action.get("action"))
+        parameters = action.get("parameters", {})
+
+        # Normalize 'resource_type' in parameters
+        if 'resource_type' in parameters:
+            parameters['resource_type'] = normalize_resource_type(parameters['resource_type'])
+
+        # Map action types to handler functions
+        action_handlers = {
+            "count_resources": handle_count_resources,
+            "get_status": handle_get_status,
+            "list_resources": handle_list_resources,
+            "get_logs": handle_get_logs,
+            "describe_resource": handle_describe_resource,
+            "unknown": handle_unknown_action,
+        }
+
+        handler = action_handlers.get(action_type)
+        if not handler:
+            logger.error(f"Unknown action type after normalization: {action_type}")
+            return "I did not understand the action required."
+
+        # Call the handler function
+        answer = handler(parameters)
+        return answer
+
+    except client.exceptions.ApiException as e:
+        logger.error(f"Kubernetes API exception: {e}")
+        return "An error occurred while communicating with the Kubernetes API."
+
+    except Exception as e:
+        logger.error(f"Error performing Kubernetes action: {e}")
+        return "An error occurred while performing the Kubernetes action."
+
+# Handler functions for different actions
+def handle_count_resources(params):
+    resource_type = params.get("resource_type")
+    namespace = params.get("namespace", "default")
+
+    if resource_type == "pod":
+        pods = core_v1_api.list_namespaced_pod(namespace=namespace)
+        count = len(pods.items)
+    elif resource_type == "deployment":
+        deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
+        count = len(deployments.items)
+    elif resource_type == "node":
+        nodes = core_v1_api.list_node()
+        count = len(nodes.items)
+    elif resource_type == "service":
+        services = core_v1_api.list_namespaced_service(namespace=namespace)
+        count = len(services.items)
+    else:
+        return f"Resource type '{resource_type}' is not supported for counting."
+
+    return str(count)
+
+def handle_get_status(params):
+    resource_type = params.get("resource_type")
+    resource_name = params.get("resource_name")
+    namespace = params.get("namespace", "default")
+
+    if resource_type == "pod":
+        pod = core_v1_api.read_namespaced_pod(name=resource_name, namespace=namespace)
+        status = pod.status.phase
+    elif resource_type == "deployment":
+        deployment = apps_v1_api.read_namespaced_deployment(name=resource_name, namespace=namespace)
+        status = deployment.status.conditions[-1].type  # Simplified status
+    elif resource_type == "service":
+        service = core_v1_api.read_namespaced_service(name=resource_name, namespace=namespace)
+        status = service.spec.type
+    else:
+        return f"Resource type '{resource_type}' is not supported for status retrieval."
+
+    return status
+
+def handle_list_resources(params):
+    resource_type = params.get("resource_type")
+    namespace = params.get("namespace", "default")
+
+    if resource_type == "pod":
+        pods = core_v1_api.list_namespaced_pod(namespace=namespace)
+        resource_names = [simplify_name(pod.metadata.name) for pod in pods.items]
+    elif resource_type == "deployment":
+        deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
+        resource_names = [simplify_name(dep.metadata.name) for dep in deployments.items]
+    elif resource_type == "service":
+        services = core_v1_api.list_namespaced_service(namespace=namespace)
+        resource_names = [simplify_name(svc.metadata.name) for svc in services.items]
+    elif resource_type == "namespace": 
+            namespaces = core_v1_api.list_namespace()
+            resource_names = [ns.metadata.name for ns in namespaces.items]
+    else:
+        return f"Resource type '{resource_type}' is not supported for listing."
+
+    return ", ".join(resource_names)
+
+def handle_get_logs(params):
+    pod_name = params.get("resource_name")
+    namespace = params.get("namespace", "default")
+
+    if not pod_name:
+        return "Pod name is required to get logs."
+
+    logs = core_v1_api.read_namespaced_pod_log(name=pod_name, namespace=namespace)
+    return logs
+
+def handle_describe_resource(params):
+    resource_type = params.get("resource_type")
+    resource_name = params.get("resource_name")
+    namespace = params.get("namespace", "default")
+
+    if resource_type == "pod":
+        pod = core_v1_api.read_namespaced_pod(name=resource_name, namespace=namespace)
+        return str(pod)
+    elif resource_type == "deployment":
+        deployment = apps_v1_api.read_namespaced_deployment(name=resource_name, namespace=namespace)
+        return str(deployment)
+    else:
+        return f"Description not supported for resource type '{resource_type}'."
+
+def handle_unknown_action(params):
+    print("User query",params)
+    user_query = params.get("query", "Unknown query")  # Use the original query for context if available
+    # Define a prompt to query the LLM for Kubernetes API suggestions
+    prompt = (
+        f"You are an assistant with knowledge of Kubernetes Python client commands. "
+        f"The user has requested an unknown action: '{user_query}'. "
+        f"Using the Kubernetes client objects 'core_v1_api' and 'apps_v1_api', "
+        f"suggest a Python command or method that would fulfill this request. "
+        f"Respond only with the suggested Python code command without additional text."
+    )
+
+    # Query the LLM for command suggestions
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a Kubernetes assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=100
+        )
+
+        # Extract the suggested command from LLM response
+        suggested_command = response.choices[0].message.content.strip()
+        logger.info(f"LLM suggested command: {suggested_command}")
+
+        # Execute the suggested command safely
+        result = eval_suggested_command(suggested_command)
+
+        # Return the result in the required format
+        return format_response(result)
+
+    except Exception as e:
+        logger.error(f"Error querying the LLM or executing suggested command: {e}")
+        return "The requested action could not be performed. Please check the query or try again."
+
+
+def eval_suggested_command(suggested_command):
+    try:
+        # Execute the suggested command and return its result
+        # Using eval in a controlled environment to avoid executing harmful code
+        local_vars = {"core_v1_api": core_v1_api, "apps_v1_api": apps_v1_api}
+        result = eval(suggested_command, {"__builtins__": None}, local_vars)
+        return result
+    except Exception as e:
+        logger.error(f"Error executing suggested command: {e}")
+        return "The command could not be executed."
+    
+def format_response(result):
+    if isinstance(result, str):
+        return result
+    elif hasattr(result, "items"):  # For lists of items like pods, deployments, etc.
+        resource_names = [simplify_name(item.metadata.name) for item in result.items]
+        return ", ".join(resource_names)
+    else:
+        return str(result)
+
+
+
+# Helper function to simplify resource names
+def simplify_name(name):
+    simplified_name = re.sub(r'-[a-z0-9]{9,}$', '', name)
+    return simplified_name
+
+@app.route('/deploy', methods=['POST'])
+def deploy_application():
+    try:
+        # Get deployment name from the request body
+        deployment_name = request.json.get('deployment_name')
+        if not deployment_name:
+            return jsonify({"error": "Deployment name is required"}), 400
+
+        # Define the YAML deployment configuration
+        deployment_yaml = {
+            'apiVersion': 'apps/v1',
+            'kind': 'Deployment',
+            'metadata': {'name': deployment_name, 'labels': {'app': 'sample-app'}},
+            'spec': {
+                'replicas': 2,
+                'selector': {'matchLabels': {'app': 'sample-app'}},
+                'template': {
+                    'metadata': {'labels': {'app': 'sample-app'}},
+                    'spec': {
+                        'containers': [{
+                            'name': 'nginx',
+                            'image': 'nginx:latest',
+                            'ports': [{'containerPort': 80}]
+                        }]
+                    }
+                }
+            }
+        }
+
+        # Save YAML configuration to a temporary file
+        yaml_file = f"{deployment_name}.yaml"
+        with open(yaml_file, 'w') as file:
+            yaml.dump(deployment_yaml, file)
+
+        # Apply the deployment using kubectl
+        subprocess.run(["kubectl", "apply", "-f", yaml_file], check=True)
+
+        # Clean up the temporary file
+        os.remove(yaml_file)
+
+        # Return a successful deployment message
+        full_name = f"deployments.apps/{deployment_name}"
+        return jsonify({"status": f"Deployment {full_name} started successfully!"})
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": f"Failed to deploy application: {str(e)}"}), 500
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+@app.route('/stop', methods=['POST'])
+def stop_deployment():
+    try:
+        deployment_name = request.json.get('deployment')
+        subprocess.run(f"kubectl delete deployment {deployment_name}", shell=True, check=True)
+        return jsonify({"status": f"Deployment {deployment_name} stopped successfully!"})
+    except subprocess.CalledProcessError:
+        return jsonify({"error": "Failed to stop deployment."}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
