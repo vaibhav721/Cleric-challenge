@@ -512,10 +512,12 @@ def simplify_name(name):
 # Helper function to find resource across all namespaces
 def find_resource_in_all_namespaces(api_method, resource_name):
     namespaces = core_v1_api.list_namespace()
+    logger.info(f"List all namespaces: {namespaces}")
     for ns in namespaces.items:
         namespace = ns.metadata.name
         try:
             resource = api_method(name=resource_name, namespace=namespace)
+            logger.info(f"Resource fetched : {resource} from resource_name: {resource_name} and namespace : {namespace}")
             return resource, namespace
         except client.exceptions.ApiException as e:
             if e.status != 404:
