@@ -73,7 +73,9 @@ def interpret_query(query_text):
         "If the user's intent does not match any of these actions, set 'action' to 'unknown'. "
         "The 'parameters' should include 'resource_type' (e.g., 'pod', 'deployment', 'service', 'node'), "
         "'resource_name' if applicable, 'namespace' if specified, and any specific 'detail' the user is requesting "
-        "(e.g., 'environment_variable', 'mount_path', 'database_name'). Do not include any additional text outside of the JSON object."
+        "(e.g., 'environment_variable', 'mount_path', 'database_name'). "
+        "Ensure 'resource_name' is the exact name used in Kubernetes, replacing spaces with hyphens if necessary, and exclude resource type abbreviations like 'svc', 'pod', etc. "
+        "Do not include any additional text outside of the JSON object."
     )
 
     user_prompt = f"User query: {query_text}\nResponse:"
@@ -118,7 +120,7 @@ def normalize_action_type(action_type):
         'describe_pod': 'describe_resource',
         'describe_deployment': 'describe_resource',
         'get_pod_details': 'describe_resource',
-        'get_resource_detail': 'get_resource_detail',  # Added new action
+        'get_resource_detail': 'get_resource_detail',
     }
     return action_mapping.get(action_type, action_type)
 
@@ -185,8 +187,19 @@ def normalize_resource_type(resource_type):
         'clusterrolebindings': 'clusterrolebinding',
         'clusterrolebinding': 'clusterrolebinding',
         'crb': 'clusterrolebinding',
+        'registry': 'deployment',  # Added mapping for 'registry'
+        'persistent volume': 'persistentvolume',  # Mapping for 'persistent volume'
     }
     return resource_type_mapping.get(resource_type.lower(), resource_type.lower())
+
+# Function to normalize resource names
+def normalize_resource_name(resource_name):
+    resource_name = resource_name.lower()
+    resource_name = resource_name.replace(' svc', '').replace(' service', '')
+    resource_name = resource_name.replace(' pod', '').replace(' deployment', '')
+    resource_name = resource_name.replace(' ', '-')
+    resource_name = re.sub(r'[^a-z0-9\-]', '', resource_name)  # Remove invalid characters
+    return resource_name.strip()
 
 # Function to perform the Kubernetes action
 def perform_kubernetes_action(action):
@@ -203,6 +216,10 @@ def perform_kubernetes_action(action):
         if 'resource_type' in parameters:
             parameters['resource_type'] = normalize_resource_type(parameters['resource_type'])
 
+        # Normalize 'resource_name' in parameters
+        if 'resource_name' in parameters:
+            parameters['resource_name'] = normalize_resource_name(parameters['resource_name'])
+
         # Map action types to handler functions
         action_handlers = {
             "count_resources": handle_count_resources,
@@ -210,7 +227,7 @@ def perform_kubernetes_action(action):
             "list_resources": handle_list_resources,
             "get_logs": handle_get_logs,
             "describe_resource": handle_describe_resource,
-            "get_resource_detail": handle_get_resource_detail,  # Added new handler
+            "get_resource_detail": handle_get_resource_detail,
             "unknown": handle_unknown_action,
         }
 
@@ -234,7 +251,6 @@ def perform_kubernetes_action(action):
 # Handler functions for different actions
 def handle_count_resources(params):
     resource_type = params.get("resource_type")
-    namespace = params.get("namespace", "default")
 
     if resource_type == "pod":
         pods = core_v1_api.list_pod_for_all_namespaces()
@@ -256,34 +272,53 @@ def handle_count_resources(params):
 def handle_get_status(params):
     resource_type = params.get("resource_type")
     resource_name = params.get("resource_name")
-    namespace = params.get("namespace", "default")
 
     if resource_type == "pod":
-        pod = core_v1_api.read_namespaced_pod(name=resource_name, namespace=namespace)
-        status = pod.status.phase
+        pod, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_pod, resource_name)
+        if pod:
+            status = pod.status.phase
+            return f"The status of pod '{resource_name}' in namespace '{namespace}' is '{status}'."
+        else:
+            return f"Pod '{resource_name}' not found in any namespace."
     elif resource_type == "deployment":
-        deployment = apps_v1_api.read_namespaced_deployment(name=resource_name, namespace=namespace)
-        status = deployment.status.conditions[-1].type  # Simplified status
+        deployment, namespace = find_resource_in_all_namespaces(apps_v1_api.read_namespaced_deployment, resource_name)
+        if deployment:
+            conditions = deployment.status.conditions
+            status = conditions[-1].type if conditions else "Unknown"
+            return f"The status of deployment '{resource_name}' in namespace '{namespace}' is '{status}'."
+        else:
+            return f"Deployment '{resource_name}' not found in any namespace."
     elif resource_type == "service":
-        service = core_v1_api.read_namespaced_service(name=resource_name, namespace=namespace)
-        status = service.spec.type
+        service, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_service, resource_name)
+        if service:
+            status = service.spec.type
+            return f"The status of service '{resource_name}' in namespace '{namespace}' is '{status}'."
+        else:
+            return f"Service '{resource_name}' not found in any namespace."
     else:
         return f"Resource type '{resource_type}' is not supported for status retrieval."
 
-    return status
-
 def handle_list_resources(params):
     resource_type = params.get("resource_type")
-    namespace = params.get("namespace", "default")
+    namespace = params.get("namespace")
 
     if resource_type == "pod":
-        pods = core_v1_api.list_namespaced_pod(namespace=namespace)
+        if namespace:
+            pods = core_v1_api.list_namespaced_pod(namespace=namespace)
+        else:
+            pods = core_v1_api.list_pod_for_all_namespaces()
         resource_names = [simplify_name(pod.metadata.name) for pod in pods.items]
     elif resource_type == "deployment":
-        deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
+        if namespace:
+            deployments = apps_v1_api.list_namespaced_deployment(namespace=namespace)
+        else:
+            deployments = apps_v1_api.list_deployment_for_all_namespaces()
         resource_names = [simplify_name(dep.metadata.name) for dep in deployments.items]
     elif resource_type == "service":
-        services = core_v1_api.list_namespaced_service(namespace=namespace)
+        if namespace:
+            services = core_v1_api.list_namespaced_service(namespace=namespace)
+        else:
+            services = core_v1_api.list_service_for_all_namespaces()
         resource_names = [simplify_name(svc.metadata.name) for svc in services.items]
     elif resource_type == "namespace":
         namespaces = core_v1_api.list_namespace()
@@ -295,10 +330,13 @@ def handle_list_resources(params):
 
 def handle_get_logs(params):
     pod_name = params.get("resource_name")
-    namespace = params.get("namespace", "default")
 
     if not pod_name:
         return "Pod name is required to get logs."
+
+    pod, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_pod, pod_name)
+    if not pod:
+        return f"Pod '{pod_name}' not found in any namespace."
 
     logs = core_v1_api.read_namespaced_pod_log(name=pod_name, namespace=namespace)
     return logs
@@ -306,17 +344,25 @@ def handle_get_logs(params):
 def handle_describe_resource(params):
     resource_type = params.get("resource_type")
     resource_name = params.get("resource_name")
-    namespace = params.get("namespace", "default")
 
     if resource_type == "pod":
-        pod = core_v1_api.read_namespaced_pod(name=resource_name, namespace=namespace)
-        return yaml.safe_dump(pod.to_dict())
+        pod, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_pod, resource_name)
+        if pod:
+            return yaml.safe_dump(pod.to_dict())
+        else:
+            return f"Pod '{resource_name}' not found in any namespace."
     elif resource_type == "deployment":
-        deployment = apps_v1_api.read_namespaced_deployment(name=resource_name, namespace=namespace)
-        return yaml.safe_dump(deployment.to_dict())
+        deployment, namespace = find_resource_in_all_namespaces(apps_v1_api.read_namespaced_deployment, resource_name)
+        if deployment:
+            return yaml.safe_dump(deployment.to_dict())
+        else:
+            return f"Deployment '{resource_name}' not found in any namespace."
     elif resource_type == "service":
-        service = core_v1_api.read_namespaced_service(name=resource_name, namespace=namespace)
-        return yaml.safe_dump(service.to_dict())
+        service, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_service, resource_name)
+        if service:
+            return yaml.safe_dump(service.to_dict())
+        else:
+            return f"Service '{resource_name}' not found in any namespace."
     else:
         return f"Description not supported for resource type '{resource_type}'."
 
@@ -324,47 +370,73 @@ def handle_get_resource_detail(params):
     resource_type = params.get("resource_type")
     resource_name = params.get("resource_name")
     detail = params.get("detail")
-    variable_name = params.get("variable_name")  # For environment variables
-    namespace = params.get("namespace", "default")
+    variable_name = params.get("variable_name") or params.get("specific_detail")
+    namespace = params.get("namespace")
 
     if not resource_name or not detail:
         return "Resource name and detail are required for getting resource details."
 
     try:
         if resource_type == "pod":
-            pod = core_v1_api.read_namespaced_pod(name=resource_name, namespace=namespace)
+            pod, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_pod, resource_name)
+            if not pod:
+                return f"Pod '{resource_name}' not found in any namespace."
             if detail == "environment_variable" and variable_name:
-                env_vars = pod.spec.containers[0].env
+                env_vars = pod.spec.containers[0].env or []
                 for env in env_vars:
                     if env.name == variable_name:
                         return f"The value of the environment variable '{variable_name}' is '{env.value}'."
                 return f"Environment variable '{variable_name}' not found in pod '{resource_name}'."
             elif detail == "mount_path":
-                volume_mounts = pod.spec.containers[0].volume_mounts
+                volume_mounts = pod.spec.containers[0].volume_mounts or []
                 mount_paths = [vm.mount_path for vm in volume_mounts]
                 return f"Mount paths for pod '{resource_name}': {', '.join(mount_paths)}"
+            elif detail == "readiness_probe_path":
+                readiness_probe = pod.spec.containers[0].readiness_probe
+                if readiness_probe and readiness_probe.http_get:
+                    path = readiness_probe.http_get.path
+                    return f"The readiness probe path for pod '{resource_name}' is '{path}'."
+                else:
+                    return f"No readiness probe path found for pod '{resource_name}'."
+            elif detail == "container_port":
+                ports = pod.spec.containers[0].ports or []
+                port_numbers = [str(port.container_port) for port in ports]
+                return f"Container ports for pod '{resource_name}': {', '.join(port_numbers)}"
             else:
                 return f"Detail '{detail}' is not supported for resource type '{resource_type}'."
         elif resource_type == "deployment":
-            deployment = apps_v1_api.read_namespaced_deployment(name=resource_name, namespace=namespace)
+            deployment, namespace = find_resource_in_all_namespaces(apps_v1_api.read_namespaced_deployment, resource_name)
+            if not deployment:
+                return f"Deployment '{resource_name}' not found in any namespace."
             if detail == "environment_variable" and variable_name:
-                env_vars = deployment.spec.template.spec.containers[0].env
+                env_vars = deployment.spec.template.spec.containers[0].env or []
                 for env in env_vars:
                     if env.name == variable_name:
                         return f"The value of the environment variable '{variable_name}' is '{env.value}'."
                 return f"Environment variable '{variable_name}' not found in deployment '{resource_name}'."
             elif detail == "mount_path":
-                volume_mounts = deployment.spec.template.spec.containers[0].volume_mounts
+                volume_mounts = deployment.spec.template.spec.containers[0].volume_mounts or []
                 mount_paths = [vm.mount_path for vm in volume_mounts]
                 return f"Mount paths for deployment '{resource_name}': {', '.join(mount_paths)}"
             else:
                 return f"Detail '{detail}' is not supported for resource type '{resource_type}'."
         elif resource_type == "service":
-            service = core_v1_api.read_namespaced_service(name=resource_name, namespace=namespace)
+            service, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_service, resource_name)
+            if not service:
+                return f"Service '{resource_name}' not found in any namespace."
             if detail == "port":
-                ports = service.spec.ports
+                ports = service.spec.ports or []
                 port_numbers = [str(port.port) for port in ports]
                 return f"Ports for service '{resource_name}': {', '.join(port_numbers)}"
+            elif detail == "namespace":
+                return f"The service '{resource_name}' is deployed in the '{namespace}' namespace."
+            else:
+                return f"Detail '{detail}' is not supported for resource type '{resource_type}'."
+        elif resource_type == "persistentvolume":
+            pv = core_v1_api.read_persistent_volume(name=resource_name)
+            if detail == "mount_path":
+                # PersistentVolumes do not have mount paths; mount paths are defined in pods or deployments.
+                return f"PersistentVolume '{resource_name}' details: {pv.spec}"
             else:
                 return f"Detail '{detail}' is not supported for resource type '{resource_type}'."
         else:
@@ -416,7 +488,7 @@ def eval_suggested_command(suggested_command):
         # Execute the suggested command and return its result
         # Using exec in a controlled environment to avoid executing harmful code
         local_vars = {"core_v1_api": core_v1_api, "apps_v1_api": apps_v1_api}
-        exec(suggested_command, {"__builtins__": None}, local_vars)
+        exec(suggested_command, {"__builtins__": {}}, local_vars)
         result = local_vars.get('result', 'Command executed.')
         return result
     except Exception as e:
@@ -436,6 +508,20 @@ def format_response(result):
 def simplify_name(name):
     simplified_name = re.sub(r'-[a-z0-9]{9,}$', '', name)
     return simplified_name
+
+# Helper function to find resource across all namespaces
+def find_resource_in_all_namespaces(api_method, resource_name):
+    namespaces = core_v1_api.list_namespace()
+    for ns in namespaces.items:
+        namespace = ns.metadata.name
+        try:
+            resource = api_method(name=resource_name, namespace=namespace)
+            return resource, namespace
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                logger.error(f"Error accessing resource '{resource_name}' in namespace '{namespace}': {e}")
+                continue
+    return None, None
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
