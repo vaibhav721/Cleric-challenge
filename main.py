@@ -289,7 +289,9 @@ def handle_get_status(params):
         else:
             return f"Deployment '{resource_name}' not found in any namespace."
     elif resource_type == "service":
+        logger.info('control came in resource_type service')
         service, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_service, resource_name)
+
         if service:
             status = service.spec.type
             return f"The status of service '{resource_name}' in namespace '{namespace}' is '{status}'."
@@ -421,7 +423,9 @@ def handle_get_resource_detail(params):
             else:
                 return f"Detail '{detail}' is not supported for resource type '{resource_type}'."
         elif resource_type == "service":
+            logger.info('Service came here insideget resource detail')
             service, namespace = find_resource_in_all_namespaces(core_v1_api.read_namespaced_service, resource_name)
+            logger.info(f"Fetched Service:{service} and namespace {namespace}")
             if not service:
                 return f"Service '{resource_name}' not found in any namespace."
             if detail == "port":
