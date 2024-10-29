@@ -78,7 +78,7 @@ def interpret_query(query_text):
 
     user_prompt = f"User query: {query_text}\nResponse:"
 
-    response = openai.ChatCompletion.create(
+    response = openai.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": system_prompt},
@@ -387,7 +387,7 @@ def handle_unknown_action(params):
 
     # Query the LLM for command suggestions
     try:
-        response = openai.ChatCompletion.create(
+        response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": "You are a Kubernetes assistant."},
